@@ -115,8 +115,19 @@ All modes share the same WebSocket connections — switching is instant, no reco
 
 - **Full terminal** rendered by xterm.js — exact same output as your local terminal
 - **Key bar** with ↑ ↓ → ← Tab Enter Esc Ctrl+C for mobile navigation
+- **⏺ Record button** — record the terminal as a .webm video, tap again to stop and download
 - **Sessions button** — switch between terminal and sessions dashboard
 - **QR code** — scan from your phone to connect instantly
+
+## Terminal Recording
+
+Tap the **⏺** button in the key bar to start recording your terminal session as a video. The button turns red and shows elapsed time (⏹ 2:35). Tap again to stop — a `.webm` video file downloads automatically.
+
+- Records at 30fps using the browser's MediaRecorder API
+- Auto-stops after 10 minutes to prevent memory issues on mobile
+- Auto-stops when you switch views or disconnect
+- Works on both phone and desktop browsers
+- No server-side tools needed — recording happens entirely in the browser
 
 ## Prerequisites
 
@@ -181,6 +192,9 @@ Yes. Use `--local` to skip tunnel creation. The terminal is available at `http:/
 
 **What's hub mode?**
 Run `cli-tunnel` with no command to start hub mode — a sessions dashboard that shows all active cli-tunnel sessions. Tap any session to connect, or use Grid view to monitor all sessions simultaneously.
+
+**How does recording work?**
+The record button captures the xterm.js canvas at 30fps using the browser's MediaRecorder API. The recording is a `.webm` video file that downloads to your device when you stop. It records exactly what you see on screen — perfect for demos and presentations. Max duration is 10 minutes.
 
 **How does the Grid view connect to sessions?**
 The hub reads session tokens from `~/.cli-tunnel/sessions/` (files with owner-only permissions). It proxies ticket requests to each session's local port — no tokens are exposed to the browser client.
