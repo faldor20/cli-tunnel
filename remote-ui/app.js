@@ -52,6 +52,65 @@
   var focusedIndex = 0;
   var tmuxPreset = 'equal';
 
+  // ─── Terminal Recording (MediaRecorder API) ───────────────
+  var mediaRecorder = null;
+  var recordedChunks = [];
+  var isRecording = false;
+
+  function startRecording() {
+    var canvas = termContainer.querySelector('canvas');
+    if (!canvas) { console.warn('No terminal canvas found'); return false; }
+    try {
+      var stream = canvas.captureStream(30); // 30 fps
+      var mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8'
+        : 'video/webm';
+      mediaRecorder = new MediaRecorder(stream, { mimeType: mimeType, videoBitsPerSecond: 2500000 });
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = function(e) {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = function() {
+        var blob = new Blob(recordedChunks, { type: mimeType });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        a.href = url;
+        a.download = 'cli-tunnel-' + timestamp + '.webm';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+      };
+      mediaRecorder.start(1000); // collect data every 1s
+      isRecording = true;
+      return true;
+    } catch (e) {
+      console.error('Recording failed:', e);
+      return false;
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    isRecording = false;
+    mediaRecorder = null;
+  }
+
+  function toggleRecording() {
+    var btn = document.getElementById('btn-record');
+    if (isRecording) {
+      stopRecording();
+      if (btn) { btn.classList.remove('recording'); btn.textContent = '⏺'; btn.title = 'Record terminal'; }
+    } else {
+      if (startRecording()) {
+        if (btn) { btn.classList.add('recording'); btn.textContent = '⏹'; btn.title = 'Stop recording & download'; }
+      }
+    }
+  }
+
   // ─── xterm.js Terminal ───────────────────────────────────
   let xterm = null;
   let fitAddon = null;
@@ -1007,6 +1066,10 @@
     };
     keyBar.addEventListener('click', function(e) {
       var btn = e.target;
+      if (btn && btn.tagName === 'BUTTON' && btn.dataset.action === 'toggle-record') {
+        toggleRecording();
+        return;
+      }
       if (btn && btn.tagName === 'BUTTON' && btn.dataset.key) {
         var key = keyMap[btn.dataset.key] || btn.dataset.key;
         if (currentView === 'grid' && gridMode === 'fullscreen' && gridTerminals[focusedIndex]) {
