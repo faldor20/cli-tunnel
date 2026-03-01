@@ -52,6 +52,89 @@
   var focusedIndex = 0;
   var tmuxPreset = 'equal';
 
+  // ─── Terminal Recording (MediaRecorder API) ───────────────
+  var mediaRecorder = null;
+  var recordedChunks = [];
+  var isRecording = false;
+  var recordTimer = null;
+
+  function startRecording() {
+    var canvas = null;
+    if (currentView === 'grid' && gridMode === 'fullscreen' && gridTerminals[focusedIndex]) {
+      canvas = gridTerminals[focusedIndex].panel.querySelector('canvas');
+    } else {
+      canvas = termContainer.querySelector('canvas');
+    }
+    if (!canvas) { console.warn('No terminal canvas found'); return false; }
+    try {
+      var stream = canvas.captureStream(30); // 30 fps
+      var mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8'
+        : 'video/webm';
+      mediaRecorder = new MediaRecorder(stream, { mimeType: mimeType, videoBitsPerSecond: 2500000 });
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = function(e) {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = function() {
+        var blob = new Blob(recordedChunks, { type: mimeType });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        a.href = url;
+        a.download = 'cli-tunnel-' + timestamp + '.webm';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+      };
+      mediaRecorder.start(1000); // collect data every 1s
+      isRecording = true;
+      // Auto-stop after 10 minutes to prevent memory issues
+      setTimeout(function() {
+        if (isRecording) { toggleRecording(); }
+      }, 10 * 60 * 1000);
+      return true;
+    } catch (e) {
+      console.error('Recording failed:', e);
+      return false;
+    }
+  }
+
+  function stopRecording() {
+    if (recordTimer) { clearInterval(recordTimer); recordTimer = null; }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    isRecording = false;
+    mediaRecorder = null;
+  }
+
+  function toggleRecording() {
+    var btn = document.getElementById('btn-record');
+    if (isRecording) {
+      stopRecording();
+      if (btn) { btn.classList.remove('recording'); btn.textContent = '⏺'; btn.title = 'Record terminal'; }
+    } else {
+      if (startRecording()) {
+        if (btn) { btn.classList.add('recording'); btn.textContent = '⏹'; btn.title = 'Stop recording & download'; btn.setAttribute('aria-label', 'Stop recording'); }
+        var recordStartTime = Date.now();
+        recordTimer = setInterval(function() {
+          if (!isRecording) { clearInterval(recordTimer); recordTimer = null; return; }
+          var elapsed = Math.floor((Date.now() - recordStartTime) / 1000);
+          var min = Math.floor(elapsed / 60);
+          var sec = elapsed % 60;
+          if (btn) btn.textContent = '⏹ ' + min + ':' + (sec < 10 ? '0' : '') + sec;
+        }, 1000);
+      } else {
+        // Show error to user
+        var prevText = statusText ? statusText.textContent : '';
+        if (statusText) { statusText.textContent = 'Recording not available'; }
+        setTimeout(function() { if (statusText && statusText.textContent === 'Recording not available') statusText.textContent = prevText; }, 3000);
+      }
+    }
+  }
+
   // ─── xterm.js Terminal ───────────────────────────────────
   let xterm = null;
   let fitAddon = null;
@@ -598,6 +681,7 @@
   }
 
   function destroyGrid() {
+    if (isRecording) { stopRecording(); var btn = document.getElementById('btn-record'); if (btn) { btn.classList.remove('recording'); btn.textContent = '⏺'; btn.title = 'Record terminal'; } }
     gridTerminals.forEach(function(gt) {
       if (gt.ws) { try { gt.ws.close(); } catch(e) {} }
       if (gt.xterm) { try { gt.xterm.dispose(); } catch(e) {} }
@@ -623,6 +707,7 @@
       return;
     }
     if (currentView === 'terminal') {
+      if (isRecording) { stopRecording(); var btn = document.getElementById('btn-record'); if (btn) { btn.classList.remove('recording'); btn.textContent = '⏺'; btn.title = 'Record terminal'; } }
       currentView = 'dashboard';
       terminal.classList.add('hidden');
       termContainer.classList.add('hidden');
@@ -853,6 +938,7 @@
       if (xterm) { lastCols = 0; lastRows = 0; sendResize(); }
     };
     ws.onclose = () => {
+      if (isRecording) { stopRecording(); var btn = document.getElementById('btn-record'); if (btn) { btn.classList.remove('recording'); btn.textContent = '⏺'; btn.title = 'Record terminal'; } }
       connected = false; acpReady = false; sessionId = null;
       setStatus('offline', 'Disconnected');
       const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempt)) + Math.random() * 1000;
@@ -1007,6 +1093,10 @@
     };
     keyBar.addEventListener('click', function(e) {
       var btn = e.target;
+      if (btn && btn.tagName === 'BUTTON' && btn.dataset.action === 'toggle-record') {
+        toggleRecording();
+        return;
+      }
       if (btn && btn.tagName === 'BUTTON' && btn.dataset.key) {
         var key = keyMap[btn.dataset.key] || btn.dataset.key;
         if (currentView === 'grid' && gridMode === 'fullscreen' && gridTerminals[focusedIndex]) {

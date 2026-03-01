@@ -197,6 +197,9 @@ header {
   -webkit-tap-highlight-color: transparent;
 }
 #key-bar button:active { background: var(--blue); color: #000; }
+#btn-record { color: var(--text-dim); }
+#btn-record.recording { color: var(--red); animation: pulse-record 1s infinite; }
+@keyframes pulse-record { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 #input-form {
   display: flex;
   align-items: center;
