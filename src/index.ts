@@ -4,16 +4,17 @@
  * cli-tunnel — Tunnel any CLI app to your phone
  *
  * Usage:
- *   cli-tunnel <command> [args...]              # local only
- *   cli-tunnel --tunnel <command> [args...]      # with devtunnel remote access
- *   cli-tunnel --tunnel --name myapp <command>   # named session
+ *   cli-tunnel <command> [args...]                           # quick Cloudflare tunnel (default)
+ *   cli-tunnel --local <command> [args...]                   # localhost only, no tunnel
+ *   cli-tunnel --cf-tunnel <name> --cf-hostname <host> ...  # named Cloudflare tunnel
+ *   cli-tunnel --name myapp <command>                        # named session
  *
  * Examples:
  *   cli-tunnel copilot --yolo
- *   cli-tunnel --tunnel copilot --yolo
- *   cli-tunnel --tunnel --name wizard copilot --agent squad
- *   cli-tunnel --tunnel python -i
- *   cli-tunnel --tunnel --port 4000 node server.js
+ *   cli-tunnel --name wizard copilot --agent squad
+ *   cli-tunnel --cf-tunnel mytunnel --cf-hostname app.example.com copilot
+ *   cli-tunnel --local python -i
+ *   cli-tunnel --port 4000 node server.js
  */
 
 import path from 'node:path';
@@ -62,11 +63,13 @@ ${BOLD}Usage:${RESET}
   cli-tunnel                              # hub mode — sessions dashboard only
 
 ${BOLD}Options:${RESET}
-  --local            Disable devtunnel (localhost only)
-  --port <n>         Bridge port (default: random)
-  --name <name>      Session name (shown in dashboard)
-  --replay           (deprecated, screen buffer is always on)
-  --help, -h         Show this help
+  --local                    Disable tunnel (localhost only)
+  --port <n>                 Bridge port (default: random)
+  --name <name>              Session name (shown in dashboard)
+  --cf-tunnel <name>         Use a named Cloudflare tunnel (requires cloudflared login)
+  --cf-hostname <hostname>   Hostname for named tunnel (e.g. myapp.example.com)
+  --no-wait                  Skip the press-any-key prompt
+  --help, -h                 Show this help
 
 ${BOLD}Examples:${RESET}
   cli-tunnel copilot --yolo               # tunnel + run copilot
@@ -74,12 +77,14 @@ ${BOLD}Examples:${RESET}
   cli-tunnel k9s                          # tunnel + run k9s
   cli-tunnel python -i                    # tunnel + run python
   cli-tunnel --name wizard copilot        # named session
-  cli-tunnel --local copilot --yolo       # localhost only, no devtunnel
+  cli-tunnel --local copilot --yolo       # localhost only, no cloudflared
+  cli-tunnel --cf-tunnel mytunnel --cf-hostname app.example.com copilot
   cli-tunnel                              # hub: see all active sessions
 
-Devtunnel is enabled by default. All flags after the command name
-pass through to the underlying app. cli-tunnel's own flags
-(--local, --port, --name) must come before the command.
+Cloudflare Tunnel (quick mode) is enabled by default. Named tunnels require
+--cf-tunnel and --cf-hostname with a Cloudflare account. All flags after the
+command name pass through to the underlying app. cli-tunnel's own flags
+(--local, --port, --name, --cf-tunnel, --cf-hostname) must come before the command.
 `);
   process.exit(0);
 }
@@ -93,13 +98,21 @@ const port = (portIdx !== -1 && args[portIdx + 1]) ? parseInt(args[portIdx + 1]!
 const nameIdx = args.indexOf('--name');
 const sessionName = (nameIdx !== -1 && args[nameIdx + 1]) ? args[nameIdx + 1]! : '';
 
+// Parse cloudflared named-tunnel flags
+const cfTunnelIdx = args.indexOf('--cf-tunnel');
+const cfTunnelName = (cfTunnelIdx !== -1 && args[cfTunnelIdx + 1]) ? args[cfTunnelIdx + 1]! : '';
+const cfHostnameIdx = args.indexOf('--cf-hostname');
+const cfHostname = (cfHostnameIdx !== -1 && args[cfHostnameIdx + 1]) ? args[cfHostnameIdx + 1]! : '';
+// Named tunnel mode requires both --cf-tunnel and --cf-hostname
+const namedTunnel = !!(cfTunnelName && cfHostname);
+
 // Everything that's not our flags is the command
-const ourFlags = new Set(['--local', '--tunnel', '--port', '--name', '--no-replay', '--no-wait']);
+const ourFlags = new Set(['--local', '--tunnel', '--port', '--name', '--no-replay', '--no-wait', '--cf-tunnel', '--cf-hostname']);
 const cmdArgs: string[] = [];
 let skip = false;
 for (let i = 0; i < args.length; i++) {
   if (skip) { skip = false; continue; }
-  if (args[i] === '--port' || args[i] === '--name') { skip = true; continue; }
+  if (args[i] === '--port' || args[i] === '--name' || args[i] === '--cf-tunnel' || args[i] === '--cf-hostname') { skip = true; continue; }
   if (args[i] === '--local' || args[i] === '--tunnel' || args[i] === '--no-replay' || args[i] === '--no-wait') continue;
   cmdArgs.push(args[i]!);
 }
@@ -117,7 +130,7 @@ function sanitizeLabel(l: string): string {
   return clean || 'unknown';
 }
 
-// F-07: Minimal env for subprocess calls (git, devtunnel) — only PATH and essentials
+// F-07: Minimal env for subprocess calls (git, cloudflared) — only PATH and essentials
 function getSubprocessEnv(): Record<string, string> {
   const safe: Record<string, string> = {};
   const allow = ['PATH', 'PATHEXT', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR', 'SHELL', 'COMSPEC',
@@ -146,11 +159,15 @@ const sessionsDir = path.join(os.homedir(), '.cli-tunnel', 'sessions');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
 let sessionFilePath: string | null = null;
 
-function writeSessionFile(tunnelId: string, tunnelUrl: string, port: number): void {
+function writeSessionFile(tunnelId: string, tunnelUrl: string, port: number, repo?: string, branch?: string): void {
   sessionFilePath = path.join(sessionsDir, `${tunnelId}.json`);
   const data = JSON.stringify({
     token: sessionToken, name: sessionName || command,
     tunnelId, tunnelUrl, port, hubMode,
+    repo: repo || 'unknown',
+    branch: branch || 'unknown',
+    // Store cfTunnelName so the delete endpoint knows whether to call cloudflared
+    cfTunnelName: namedTunnel ? cfTunnelName : undefined,
     machine: os.hostname(), pid: process.pid,
     createdAt: new Date().toISOString(),
   });
@@ -303,39 +320,41 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Sessions API
+  // Sessions API — reads session files written by each cli-tunnel process
+  // Sessions are discovered via ~/.cli-tunnel/sessions/*.json (filesystem IPC).
+  // Cloudflare quick tunnels have no enumeration API, so the filesystem is
+  // the source of truth — each process writes its file at startup and removes it on exit.
   if ((req.url === '/api/sessions' || req.url?.startsWith('/api/sessions?')) && req.method === 'GET') {
     try {
-      const output = execFileSync('devtunnel', ['list', '--labels', 'cli-tunnel', '--json'], { encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
-      const data = JSON.parse(output);
       const localMachine = os.hostname();
-      const localSessions = hubMode ? readLocalSessions() : [];
-      const tokenMap = new Map(localSessions.map(s => [s.tunnelId, s.token]));
+      // Read all active session files; each file is written at startup and removed on exit
+      const allSessions = fs.readdirSync(sessionsDir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => {
+          try { return JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf-8')); }
+          catch { return null; }
+        })
+        .filter((s): s is any => s !== null && !s.hubMode);
 
-      const sessions = (data.tunnels || []).map((t: any) => {
-        const labels = t.labels || [];
-        const id = t.tunnelId?.replace(/\.\w+$/, '') || t.tunnelId;
-        const cluster = t.tunnelId?.split('.').pop() || 'euw';
-        const portLabel = labels.find((l: string) => l.startsWith('port-'));
-        const p = portLabel ? parseInt(portLabel.replace('port-', ''), 10) : 3456;
-        const machine = labels[4] || 'unknown';
+      const sessions = allSessions.map((s: any) => {
         const session: any = {
-          id, tunnelId: t.tunnelId,
-          name: labels[1] || 'unnamed',
-          repo: labels[2] || 'unknown',
-          branch: (labels[3] || 'unknown').replace(/_/g, '/'),
-          machine,
-          online: (t.hostConnections || 0) > 0,
-          port: p,
-          url: `https://${id}-${p}.${cluster}.devtunnels.ms`,
-          isLocal: machine === localMachine,
+          id: s.tunnelId,
+          tunnelId: s.tunnelId,
+          name: s.name || 'unnamed',
+          repo: s.repo || 'unknown',
+          branch: s.branch || 'unknown',
+          machine: s.machine || 'unknown',
+          // A session is "online" if its file exists — process removes it on clean exit
+          online: true,
+          port: s.port,
+          url: s.tunnelUrl,
+          isLocal: s.machine === localMachine,
         };
         // F-05: Never expose raw tokens in API responses — only indicate availability
-        const baseId = t.tunnelId?.split('.')[0] || t.tunnelId;
-        const token = tokenMap.get(baseId) || tokenMap.get(t.tunnelId);
-        if (token) session.hasToken = true;
+        if (s.token) session.hasToken = true;
         return session;
       });
+
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
       res.end(JSON.stringify({ sessions }));
     } catch {
@@ -345,40 +364,52 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Delete session
-  // F-05: Only allow deleting tunnels owned by this machine
+  // Delete session — removes the local session file and optionally cleans up named tunnels
+  // Quick tunnels auto-expire when the cloudflared process exits, so only the session
+  // file needs to be removed. Named tunnels get an explicit `cloudflared tunnel delete`.
+  // Ownership is verified via the session file's machine field (not tunnel labels).
   if (req.url?.startsWith('/api/sessions/') && req.method === 'DELETE') {
-    const tunnelId = req.url.replace('/api/sessions/', '').replace(/\.\w+$/, '');
+    const tunnelId = decodeURIComponent(req.url.replace('/api/sessions/', ''));
     if (!/^[a-zA-Z0-9._-]+$/.test(tunnelId)) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
       res.end(JSON.stringify({ error: 'Invalid tunnel ID' }));
       return;
     }
-    // Verify the tunnel belongs to this machine before allowing delete
+
+    // Look up the session file to verify ownership
+    const sessionFile = path.join(sessionsDir, `${tunnelId}.json`);
+    let sessionData: any = null;
     try {
-      const verifyOut = execFileSync('devtunnel', ['show', tunnelId, '--json'], { encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
-      const verifyData = JSON.parse(verifyOut);
-      const labels = verifyData.tunnel?.labels || [];
-      const tunnelMachine = labels[4] || '';
-      if (tunnelMachine !== os.hostname()) {
-        res.writeHead(403, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
-        res.end(JSON.stringify({ error: 'Cannot delete tunnels from other machines' }));
-        return;
-      }
+      sessionData = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
     } catch {
-      // If we can't verify ownership, deny the delete
-      res.writeHead(403, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
-      res.end(JSON.stringify({ error: 'Cannot verify tunnel ownership' }));
+      res.writeHead(404, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
+      res.end(JSON.stringify({ error: 'Session not found' }));
       return;
     }
-    try {
-      execFileSync('devtunnel', ['delete', tunnelId, '--force'], { encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
-      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
-      res.end(JSON.stringify({ deleted: true }));
-    } catch {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
-      res.end(JSON.stringify({ deleted: false }));
+
+    // Only allow deleting sessions that belong to this machine
+    if (sessionData.machine !== os.hostname()) {
+      res.writeHead(403, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
+      res.end(JSON.stringify({ error: 'Cannot delete sessions from other machines' }));
+      return;
     }
+
+    // Remove the session file so hub stops listing it
+    try { fs.unlinkSync(sessionFile); } catch {}
+
+    // For named Cloudflare tunnels: attempt to delete via cloudflared CLI
+    // Quick tunnels (trycloudflare.com) don't need explicit deletion — they expire on process exit
+    const isNamedTunnel = sessionData.tunnelUrl && !sessionData.tunnelUrl.includes('trycloudflare.com');
+    if (isNamedTunnel && sessionData.cfTunnelName) {
+      try {
+        execFileSync('cloudflared', ['tunnel', 'delete', '-f', sessionData.cfTunnelName], {
+          encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv(),
+        });
+      } catch { /* non-fatal — tunnel may already be gone */ }
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' });
+    res.end(JSON.stringify({ deleted: true }));
     return;
   }
 
@@ -410,7 +441,7 @@ const server = http.createServer(async (req, res) => {
     'Content-Type': mimes[ext] || 'application/octet-stream',
     'X-Frame-Options': 'DENY',
     'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/ https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/ https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://*.devtunnels.ms https://*.devtunnels.ms;",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/ https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/ https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://*.trycloudflare.com https://*.trycloudflare.com wss://*.cfargotunnel.com https://*.cfargotunnel.com;",
     'Referrer-Policy': 'no-referrer',
     'Cache-Control': 'no-store',
     'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
@@ -429,13 +460,18 @@ const wss = new WebSocketServer({
 
     // F-18: Session expiry
     if (Date.now() - sessionCreatedAt > SESSION_TTL) return false;
-    // F-3: Validate origin when present (devtunnel proxies may strip it)
+    // F-3: Validate origin when present (Cloudflare proxies may strip it)
+    // Allow localhost, Cloudflare quick tunnel domains, and named tunnel hostnames
     const origin = info.req.headers.origin;
     if (origin) {
       try {
         const originUrl = new URL(origin);
         const host = originUrl.hostname;
-        if (host !== 'localhost' && host !== '127.0.0.1' && !host.endsWith('.devtunnels.ms')) {
+        const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+        const isQuickTunnel = host.endsWith('.trycloudflare.com');
+        // Named tunnels use cfargotunnel.com internally, or the user's custom hostname
+        const isNamedTunnel = host.endsWith('.cfargotunnel.com') || (cfHostname !== '' && host === cfHostname);
+        if (!isLocalhost && !isQuickTunnel && !isNamedTunnel) {
           return false;
         }
       } catch { return false; }
@@ -659,34 +695,40 @@ async function main() {
     console.log(`  ${DIM}Session expires:${RESET} ${new Date(sessionCreatedAt + SESSION_TTL).toLocaleTimeString()}`);
   }
 
-  // Tunnel
+  // ─── Tunnel setup (Cloudflare Tunnels) ──────────────────────
   if (hasTunnel) {
-    // Check if devtunnel is installed
-    let devtunnelInstalled = false;
+    // Check if cloudflared is installed; offer to install if missing
+    let cloudflaredInstalled = false;
     try {
-      execFileSync('devtunnel', ['--version'], { stdio: 'pipe', env: getSubprocessEnv() });
-      devtunnelInstalled = true;
+      execFileSync('cloudflared', ['--version'], { stdio: 'pipe', env: getSubprocessEnv() });
+      cloudflaredInstalled = true;
     } catch {
-      console.log(`\n  ${YELLOW}⚠ devtunnel CLI not found!${RESET}\n`);
+      console.log(`\n  ${YELLOW}⚠ cloudflared CLI not found!${RESET}\n`);
       let installCmd = '';
       if (process.platform === 'win32') {
-        installCmd = 'winget install Microsoft.devtunnel';
+        installCmd = 'winget install --id Cloudflare.cloudflared';
       } else if (process.platform === 'darwin') {
-        installCmd = 'brew install --cask devtunnel';
+        installCmd = 'brew install cloudflared';
       } else {
-        installCmd = 'curl -sL https://aka.ms/DevTunnelCliInstall | bash';
+        // Linux: download binary directly from latest GitHub release
+        installCmd = 'curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared';
       }
       const answer = await askUser(`  Would you like to install it now? (${GREEN}${installCmd}${RESET}) [Y/n] `);
       if (answer === '' || answer === 'y' || answer === 'yes') {
-        console.log(`\n  ${DIM}Installing devtunnel...${RESET}\n`);
+        console.log(`\n  ${DIM}Installing cloudflared...${RESET}\n`);
         try {
-          const installParts = installCmd.split(' ');
-          const installProc = spawn(installParts[0]!, installParts.slice(1), { stdio: 'inherit', shell: process.platform !== 'win32' && installCmd.includes('|'), env: getSubprocessEnv() });
+          // Use shell:true for the Linux pipe-based command
+          const needsShell = installCmd.includes('&&') || installCmd.includes('|');
+          const installProc = spawn(
+            needsShell ? installCmd : installCmd.split(' ')[0]!,
+            needsShell ? [] : installCmd.split(' ').slice(1),
+            { stdio: 'inherit', shell: needsShell, env: getSubprocessEnv() }
+          );
           await new Promise<void>((resolve, reject) => {
             installProc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Install exited with code ${code}`)));
             installProc.on('error', reject);
           });
-          // Refresh PATH — winget updates the registry but current process has stale PATH
+          // Refresh PATH on Windows — winget updates the registry but current process has stale PATH
           if (process.platform === 'win32') {
             try {
               const userPath = execFileSync('reg', ['query', 'HKCU\\Environment', '/v', 'Path'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
@@ -695,116 +737,175 @@ async function main() {
               process.env.PATH = `${extractPath(userPath)};${extractPath(sysPath)}`;
             } catch { /* keep existing PATH */ }
           }
-          // Verify installation
-          execFileSync('devtunnel', ['--version'], { stdio: 'pipe', env: getSubprocessEnv() });
-          console.log(`\n  ${GREEN}✓${RESET} devtunnel installed successfully!\n`);
-          devtunnelInstalled = true;
+          execFileSync('cloudflared', ['--version'], { stdio: 'pipe', env: getSubprocessEnv() });
+          console.log(`\n  ${GREEN}✓${RESET} cloudflared installed successfully!\n`);
+          cloudflaredInstalled = true;
         } catch (err) {
           console.log(`\n  ${YELLOW}⚠${RESET} Installation failed: ${(err as Error).message}`);
           console.log(`  ${DIM}You can install it manually: ${installCmd}${RESET}\n`);
           console.log(`  ${DIM}Continuing without tunnel (local only)...${RESET}\n`);
         }
       } else {
-        console.log(`\n  ${DIM}More info: https://aka.ms/devtunnels/doc${RESET}`);
+        console.log(`\n  ${DIM}More info: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/${RESET}`);
         console.log(`  ${DIM}Continuing without tunnel (local only)...${RESET}\n`);
       }
     }
 
-    if (devtunnelInstalled) {
-      // Check if logged in before attempting tunnel creation
-      try {
-        const userInfo = execFileSync('devtunnel', ['user', 'show'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
-        if (userInfo.includes('not logged in') || userInfo.includes('No user') || userInfo.includes('Anonymous')) {
-          throw new Error('not logged in');
-        }
-      } catch {
-        console.log(`\n  ${YELLOW}⚠ devtunnel not authenticated.${RESET}\n`);
+    // Named tunnels require a Cloudflare account — check for cert.pem login credential
+    if (cloudflaredInstalled && namedTunnel) {
+      const certPath = path.join(os.homedir(), '.cloudflared', 'cert.pem');
+      if (!fs.existsSync(certPath)) {
+        console.log(`\n  ${YELLOW}⚠ cloudflared not authenticated (no cert.pem found).${RESET}\n`);
         const loginAnswer = await askUser(`  Would you like to log in now? [Y/n] `);
         if (loginAnswer === '' || loginAnswer === 'y' || loginAnswer === 'yes') {
           try {
-            const loginProc = spawn('devtunnel', ['user', 'login'], { stdio: 'inherit', env: getSubprocessEnv() });
+            const loginProc = spawn('cloudflared', ['tunnel', 'login'], { stdio: 'inherit', env: getSubprocessEnv() });
             await new Promise<void>((resolve, reject) => {
               loginProc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Login exited with code ${code}`)));
               loginProc.on('error', reject);
             });
             console.log(`\n  ${GREEN}✓${RESET} Logged in successfully!\n`);
           } catch {
-            console.log(`\n  ${YELLOW}⚠${RESET} Login failed. Run manually: ${GREEN}devtunnel user login${RESET}\n`);
+            console.log(`\n  ${YELLOW}⚠${RESET} Login failed. Run manually: ${GREEN}cloudflared tunnel login${RESET}\n`);
             console.log(`  ${DIM}Continuing without tunnel (local only)...${RESET}\n`);
-            devtunnelInstalled = false;
+            cloudflaredInstalled = false;
           }
         } else {
-          console.log(`\n  ${DIM}Run this once to log in: ${GREEN}devtunnel user login${RESET}`);
+          console.log(`\n  ${DIM}Run this once to log in: ${GREEN}cloudflared tunnel login${RESET}`);
           console.log(`  ${DIM}Continuing without tunnel (local only)...${RESET}\n`);
-          devtunnelInstalled = false;
+          cloudflaredInstalled = false;
         }
       }
     }
 
-    if (devtunnelInstalled) {
+    if (cloudflaredInstalled) {
       try {
-      const labelValues = ['cli-tunnel', sanitizeLabel(sessionName || command), sanitizeLabel(repo), sanitizeLabel(branch), sanitizeLabel(machine), `port-${actualPort}`];
-      const labelArgs = labelValues.flatMap(l => ['--labels', l]);
-      const createOut = execFileSync('devtunnel', ['create', ...labelArgs, '--expiration', '1d', '--json'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv() });
-      const tunnelId = JSON.parse(createOut).tunnel?.tunnelId?.split('.')[0];
-      const cluster = JSON.parse(createOut).tunnel?.tunnelId?.split('.')[1] || 'euw';
-      execFileSync('devtunnel', ['port', 'create', tunnelId, '-p', String(actualPort), '--protocol', 'http'], { stdio: 'pipe', env: getSubprocessEnv() });
-      const hostProc = spawn('devtunnel', ['host', tunnelId], { stdio: 'pipe', detached: false, env: getSubprocessEnv() });
+        let hostProc: ReturnType<typeof spawn>;
+        let tunnelId: string;
+        let tunnelUrl: string;
 
-      const url = await new Promise<string>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Tunnel timeout')), 15000);
-        let out = '';
-        hostProc.stdout?.on('data', (d: Buffer) => {
-          out += d.toString();
-          const match = out.match(/https:\/\/[^\s]+/);
-          if (match) { clearTimeout(timeout); resolve(match[0]); }
-        });
-        hostProc.on('error', (e) => { clearTimeout(timeout); reject(e); });
-      });
-
-      const tunnelUrlWithToken = `${url}?token=${sessionToken}${hubMode ? '&hub=1' : ''}`;
-      console.log(`  ${GREEN}✓${RESET} Tunnel: ${BOLD}${tunnelUrlWithToken}${RESET}`);
-      console.log(`  ${YELLOW}⚠ Token in URL — do not share in screen recordings or public channels${RESET}\n`);
-
-      // Write session file for hub discovery
-      writeSessionFile(tunnelId, url, actualPort);
-
-      try {
-        // @ts-ignore
-        const qr = (await import('qrcode-terminal')) as any;
-        qr.default.generate(tunnelUrlWithToken, { small: true }, (code: string) => console.log(code));
-      } catch {}
-
-      process.on('SIGINT', () => { removeSessionFile(); hostProc.kill(); try { execFileSync('devtunnel', ['delete', tunnelId, '--force'], { stdio: 'pipe', env: getSubprocessEnv() }); } catch {} });
-      process.on('exit', () => { removeSessionFile(); hostProc.kill(); try { execFileSync('devtunnel', ['delete', tunnelId, '--force'], { stdio: 'pipe', env: getSubprocessEnv() }); } catch {} });
-    } catch (err) {
-      const errMsg = (err as Error).message || '';
-      // Detect auth failure at create time (expired token, anonymous, etc.)
-      if (errMsg.includes('Anonymous') || errMsg.includes('Unauthorized') || errMsg.includes('not permitted')) {
-        console.log(`\n  ${YELLOW}⚠ devtunnel session expired or not authenticated.${RESET}\n`);
-        const loginAnswer = await askUser(`  Would you like to log in now? [Y/n] `);
-        if (loginAnswer === '' || loginAnswer === 'y' || loginAnswer === 'yes') {
+        if (namedTunnel) {
+          // ── Named tunnel mode ────────────────────────────────
+          // Create the tunnel if it doesn't already exist (idempotent)
+          let namedTunnelUuid = '';
           try {
-            const loginProc = spawn('devtunnel', ['user', 'login'], { stdio: 'inherit', env: getSubprocessEnv() });            await new Promise<void>((resolve, reject) => {
-              loginProc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Login exited with code ${code}`)));
-              loginProc.on('error', reject);
+            const createOut = execFileSync('cloudflared', ['tunnel', 'create', cfTunnelName], {
+              encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv(),
             });
-            console.log(`\n  ${GREEN}✓${RESET} Logged in! Please run cli-tunnel again to create the tunnel.\n`);
-          } catch {
-            console.log(`\n  ${YELLOW}⚠${RESET} Login failed. Run manually: ${GREEN}devtunnel user login${RESET}\n`);
+            // Parse UUID from output like: "Created tunnel my-tunnel with id abc-123"
+            const uuidMatch = createOut.match(/with id ([a-f0-9-]{36})/i);
+            namedTunnelUuid = uuidMatch ? uuidMatch[1]! : cfTunnelName;
+          } catch (err) {
+            // "already exists" is fine — look up its UUID
+            const errMsg = (err as any).stderr?.toString() || (err as Error).message || '';
+            if (!errMsg.includes('already exist')) throw err;
+            try {
+              const listOut = execFileSync('cloudflared', ['tunnel', 'list', '-o', 'json'], {
+                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv(),
+              });
+              const tunnels = JSON.parse(listOut) as Array<{ id: string; name: string }>;
+              const existing = tunnels.find(t => t.name === cfTunnelName);
+              namedTunnelUuid = existing?.id || cfTunnelName;
+            } catch { namedTunnelUuid = cfTunnelName; }
           }
+
+          // Route DNS: create a CNAME pointing cfHostname → <uuid>.cfargotunnel.com
+          // This is idempotent — cloudflared will update if already exists
+          try {
+            execFileSync('cloudflared', ['tunnel', 'route', 'dns', cfTunnelName, cfHostname], {
+              stdio: ['pipe', 'pipe', 'pipe'], env: getSubprocessEnv(),
+            });
+          } catch {
+            // DNS route failures are non-fatal — may already exist or DNS propagation pending
+            console.log(`  ${YELLOW}⚠${RESET} DNS route setup failed (may already exist — continuing)\n`);
+          }
+
+          tunnelId = namedTunnelUuid;
+          tunnelUrl = `https://${cfHostname}`;
+
+          // Start the named tunnel host process, forwarding local port
+          hostProc = spawn('cloudflared', [
+            'tunnel', '--url', `http://127.0.0.1:${actualPort}`, 'run', cfTunnelName,
+          ], { stdio: 'pipe', detached: false, env: getSubprocessEnv() });
+
+          // Named tunnels: wait for the host process to confirm connectivity
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Tunnel timeout')), 30000);
+            let output = '';
+            // cloudflared logs to stderr
+            hostProc.stderr?.on('data', (d: Buffer) => {
+              output += d.toString();
+              // Registered connection indicates the tunnel is live
+              if (output.includes('Registered tunnel connection') || output.includes('Connected to')) {
+                clearTimeout(timeout);
+                resolve();
+              }
+            });
+            hostProc.on('error', (e) => { clearTimeout(timeout); reject(e); });
+          });
+        } else {
+          // ── Quick tunnel mode (default, no account needed) ────
+          // A single `cloudflared tunnel --url` command handles everything:
+          // it contacts trycloudflare.com, gets an ephemeral URL, and starts hosting
+          hostProc = spawn('cloudflared', [
+            'tunnel', '--url', `http://127.0.0.1:${actualPort}`,
+          ], { stdio: 'pipe', detached: false, env: getSubprocessEnv() });
+
+          // Extract the trycloudflare.com URL from cloudflared's stderr log output
+          tunnelUrl = await new Promise<string>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Tunnel timeout — cloudflared did not emit a URL within 20s')), 20000);
+            let output = '';
+            // cloudflared writes all log output to stderr (not stdout)
+            hostProc.stderr?.on('data', (d: Buffer) => {
+              output += d.toString();
+              const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+              if (match) { clearTimeout(timeout); resolve(match[0]!); }
+            });
+            hostProc.on('error', (e) => { clearTimeout(timeout); reject(e); });
+          });
+
+          // Use the subdomain portion as the stable session ID
+          const subdomain = tunnelUrl.replace('https://', '').replace('.trycloudflare.com', '');
+          tunnelId = subdomain;
         }
-      } else {
+
+        const tunnelUrlWithToken = `${tunnelUrl}?token=${sessionToken}${hubMode ? '&hub=1' : ''}`;
+        console.log(`  ${GREEN}✓${RESET} Tunnel: ${BOLD}${tunnelUrlWithToken}${RESET}`);
+        console.log(`  ${YELLOW}⚠ Token in URL — do not share in screen recordings or public channels${RESET}\n`);
+
+        // Write session file for hub discovery
+        writeSessionFile(tunnelId, tunnelUrl, actualPort, repo, branch);
+
+        try {
+          // @ts-ignore
+          const qr = (await import('qrcode-terminal')) as any;
+          qr.default.generate(tunnelUrlWithToken, { small: true }, (code: string) => console.log(code));
+        } catch {}
+
+        // Cleanup on exit:
+        // Quick tunnels: kill the process — they disappear automatically
+        // Named tunnels: kill the process; leave the tunnel registered for reuse
+        process.on('SIGINT', () => {
+          removeSessionFile();
+          hostProc.kill();
+          // Named tunnels: the tunnel registration persists — only the host process is stopped
+        });
+        process.on('exit', () => {
+          removeSessionFile();
+          hostProc.kill();
+        });
+      } catch (err) {
+        const errMsg = (err as Error).message || '';
         console.log(`  ${YELLOW}⚠${RESET} Tunnel failed: ${errMsg}\n`);
+        console.log(`  ${DIM}Continuing without tunnel (local only)...${RESET}\n`);
       }
-    }
-    } // end if (devtunnelInstalled)
+    } // end if (cloudflaredInstalled)
   }
 
   // Write session file for local-only sessions (no tunnel) so hub can discover them
   if (!hasTunnel && !hubMode && !sessionFilePath) {
     const localId = `local-${actualPort}`;
-    writeSessionFile(localId, `http://127.0.0.1:${actualPort}`, actualPort);
+    writeSessionFile(localId, `http://127.0.0.1:${actualPort}`, actualPort, repo, branch);
     process.on('SIGINT', () => { removeSessionFile(); });
     process.on('exit', () => { removeSessionFile(); });
   }

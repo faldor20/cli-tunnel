@@ -14,9 +14,9 @@ npx cli-tunnel k9s
 
 1. Your command runs in a **PTY** (pseudo-terminal) — full TUI with colors, diffs, interactive prompts
 2. Raw terminal output is streamed over **WebSocket** to **xterm.js** in your browser
-3. **Microsoft Dev Tunnels** provide an authenticated HTTPS relay — zero servers to deploy
+3. **Cloudflare Tunnel** provides an HTTPS relay — zero servers to deploy, no account needed
 4. **Bidirectional**: type on your phone → keystrokes go into the CLI session
-5. **Private by default**: only your Microsoft/GitHub account can access the tunnel
+5. **Token-protected**: a cryptographic session token in the URL controls access
 
 ## Install
 
@@ -30,7 +30,7 @@ Or use directly with npx (no install needed):
 npx cli-tunnel <command> [args...]
 ```
 
-If devtunnel isn't installed, cli-tunnel will offer to install it for you automatically.
+If cloudflared isn't installed, cli-tunnel will offer to install it for you automatically.
 
 ## Quick Start
 
@@ -45,7 +45,7 @@ cli-tunnel copilot --yolo
 
 ## Usage
 
-Devtunnel is enabled by default. All flags after the command name pass through to the underlying app — cli-tunnel doesn't interpret them.
+Cloudflare Tunnel (quick mode) is enabled by default — no account needed. All flags after the command name pass through to the underlying app — cli-tunnel doesn't interpret them.
 
 ```bash
 # Run copilot with any flags
@@ -67,9 +67,12 @@ cli-tunnel --port 4000 copilot
 
 # Local only (no tunnel, localhost access only)
 cli-tunnel --local copilot --yolo
+
+# Named Cloudflare tunnel (requires a Cloudflare account + domain)
+cli-tunnel --cf-tunnel mytunnel --cf-hostname app.example.com copilot
 ```
 
-**cli-tunnel's own flags** (`--local`, `--port`, `--name`, `--no-wait`) must come **before** the command.
+**cli-tunnel's own flags** (`--local`, `--port`, `--name`, `--no-wait`, `--cf-tunnel`, `--cf-hostname`) must come **before** the command.
 
 ## Hub Mode — Sessions Dashboard
 
@@ -81,7 +84,7 @@ cli-tunnel
 
 ![Hub dashboard](docs/images/hub-dashboard.png)
 
-The hub discovers sessions via devtunnel labels. Sessions on the same machine are directly connectable — tap a session card to open it. Remote sessions (other machines) are visible but shown with a 🔒 icon.
+The hub discovers sessions via local session files (`~/.cli-tunnel/sessions/`). Sessions on the same machine are directly connectable — tap a session card to open it. Remote sessions (other machines) are visible but shown with a 🔒 icon.
 
 ## Grid View — Monitor All Sessions
 
@@ -132,18 +135,19 @@ Tap the **⏺** button in the key bar to start recording your terminal session a
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 22+ (Node 20 works too; Node 23 may need the latest beta)
-- [Microsoft Dev Tunnels CLI](https://aka.ms/devtunnels/doc) — cli-tunnel offers to install it if missing
+- [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) — cli-tunnel offers to install it if missing
   ```bash
-  winget install Microsoft.devtunnel   # Windows
-  brew install --cask devtunnel        # macOS
+  winget install --id Cloudflare.cloudflared   # Windows
+  brew install cloudflared                     # macOS
+  # Linux: downloaded automatically from GitHub releases
   ```
-  Then authenticate once: `devtunnel user login`
+  Quick tunnels (default) require no account or login. Named tunnels (`--cf-tunnel`) require a free Cloudflare account.
 
 ## Security
 
 cli-tunnel uses a layered security model:
 
-**Network layer** — Microsoft Dev Tunnels are private by default. Only the Microsoft or GitHub account that created the tunnel can connect. TLS encryption is handled by Microsoft's relay infrastructure. No inbound ports are opened on your machine.
+**Network layer** — Cloudflare Tunnel provides the HTTPS relay. Quick tunnels (`trycloudflare.com`) are publicly routable but protected by the session token. TLS encryption is handled by Cloudflare's infrastructure. No inbound ports are opened on your machine.
 
 **Session authentication** — Each session generates a unique token (cryptographic random UUID). All HTTP API and WebSocket connections require this token. The token is embedded in the URL you receive at startup.
 
@@ -183,12 +187,12 @@ The CLI session keeps running on your machine. When you reconnect, a rolling rep
 Yes. Any command that runs in a terminal works — copilot, vim, htop, python, ssh, k9s, node, and more. cli-tunnel doesn't interpret the command's output; it streams raw terminal bytes.
 
 **Is there a central server?**
-No. cli-tunnel runs entirely on your machine. Microsoft Dev Tunnels provides the relay infrastructure, but no third-party server sees your terminal content.
+No. cli-tunnel runs entirely on your machine. Cloudflare Tunnel provides the relay infrastructure — it proxies encrypted traffic but only the session token holder can establish a WebSocket connection.
 
 **What about the anti-phishing page?**
-The first time you open a devtunnel URL, Microsoft shows an interstitial warning page. This is a devtunnel security feature. You only see it once per tunnel.
+The first time you open a trycloudflare.com URL, Cloudflare may show a brief interstitial. This only appears on first access.
 
-**Does the tool work without devtunnel?**
+**Does the tool work without cloudflared?**
 Yes. Use `--local` to skip tunnel creation. The terminal is available at `http://127.0.0.1:<port>` on localhost only.
 
 **What's hub mode?**
@@ -198,14 +202,14 @@ Run `cli-tunnel` with no command to start hub mode — a sessions dashboard that
 Recording via canvas capture is not currently supported due to xterm.js WebGL renderer limitations. This feature may return in a future release.
 
 **How does the Grid view connect to sessions?**
-The hub acts as a relay — your phone has a single WebSocket to the hub, and the hub opens local connections to each session on your behalf. Session tokens are read from `~/.cli-tunnel/sessions/` (owner-only permissions) and never exposed to the browser. This means grid panels work even from a phone over devtunnel without needing individual tunnel connections to each session.
+The hub acts as a relay — your phone has a single WebSocket to the hub, and the hub opens local connections to each session on your behalf. Session tokens are read from `~/.cli-tunnel/sessions/` (owner-only permissions) and never exposed to the browser. This means grid panels work even from a phone over a Cloudflare Tunnel without needing individual tunnel connections to each session.
 
 ## How It's Built
 
 - **[node-pty](https://github.com/microsoft/node-pty)** — spawns the command in a pseudo-terminal
 - **[xterm.js](https://xtermjs.org/)** — terminal emulator in the browser (loaded from CDN with SRI hashes)
 - **[ws](https://github.com/websockets/ws)** — WebSocket server for real-time streaming
-- **[Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/)** — authenticated HTTPS relay
+- **[cloudflared](https://github.com/cloudflare/cloudflared)** — HTTPS tunnel relay via Cloudflare's network
 
 ## Blog Post
 
